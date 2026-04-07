@@ -6,7 +6,7 @@ from io import BytesIO
 import pandas as pd
 import pytesseract
 import streamlit as st
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageFilter
 from pdf2image import convert_from_path
 from openpyxl import load_workbook
 
@@ -173,6 +173,18 @@ def extract_colli_number(line):
     return ""
 
 
+def preprocess_for_ocr(img):
+    img = img.convert("L")
+    img = ImageOps.autocontrast(img)
+    img = img.filter(ImageFilter.SHARPEN)
+    img = img.point(lambda p: 255 if p > 170 else 0)
+    return img
+
+
+def line_looks_like_item_row(line):
+    return re.search(r"\b\d{4}\s*-\s*\d{4}\b", line) is not None
+
+
 def load_pages_from_upload(uploaded_file):
     ext = os.path.splitext(uploaded_file.name)[1].lower()
 
@@ -195,6 +207,7 @@ def load_pages_from_upload(uploaded_file):
 def process_delivery_files(delivery_files):
     all_items = []
     preview_images = []
+    ocr_text_records = []
 
     progress = st.progress(0, text="Starting OCR processing...")
     total_files = len(delivery_files)
@@ -207,8 +220,10 @@ def process_delivery_files(delivery_files):
 
         pages = load_pages_from_upload(uploaded_file)
 
+        table_started_in_previous_page = False
+
         for page_index, page_img in enumerate(pages, start=1):
-            processed_img = ImageOps.autocontrast(page_img)
+            processed_img = preprocess_for_ocr(page_img)
             preview_images.append((f"{uploaded_file.name} - Page {page_index}", processed_img))
 
             text = pytesseract.image_to_string(
@@ -216,10 +231,18 @@ def process_delivery_files(delivery_files):
                 config="--psm 6 -c preserve_interword_spaces=1"
             )
 
+            ocr_text_records.append(
+                {
+                    "SourceFile": uploaded_file.name,
+                    "PageNumber": page_index,
+                    "OCR_Text": text,
+                }
+            )
+
             document_number = extract_document_number(text)
 
             lines = text.split("\n")
-            capture = False
+            capture = table_started_in_previous_page
             current_colli = ""
             page_item_count = 0
 
@@ -238,7 +261,14 @@ def process_delivery_files(delivery_files):
                     capture = True
                     continue
 
+                if not capture and line_looks_like_item_row(line):
+                    capture = True
+
                 if not capture:
+                    continue
+
+                if is_end_of_table(line):
+                    capture = False
                     continue
 
                 line = re.split(
@@ -247,14 +277,10 @@ def process_delivery_files(delivery_files):
                     flags=re.IGNORECASE
                 )[0].strip()
 
-                if is_end_of_table(line):
-                    capture = False
-                    continue
-
                 if not line:
                     continue
 
-                item_match = re.search(r"^(\d{4}\s*-\s*\d{4})\s+(.+)$", line)
+                item_match = re.search(r"^\s*(\d{4}\s*-\s*\d{4})\s+(.+)$", line)
                 if not item_match:
                     continue
 
@@ -283,7 +309,7 @@ def process_delivery_files(delivery_files):
 
                 if quantity is None:
                     fallback_match = re.search(
-                        r"(.+?)\s+([\d.,]+)(?:\s+\w+)?$",
+                        r"(.+?)\s+([\d.,]+)(?:\s+[A-Za-zÄÖÜäöü\.]+)?$",
                         remainder,
                         re.IGNORECASE,
                     )
@@ -316,9 +342,12 @@ def process_delivery_files(delivery_files):
 
                 page_item_count += 1
 
+            table_started_in_previous_page = page_item_count > 0
+
     progress.progress(100, text="OCR processing complete.")
 
     raw_df = pd.DataFrame(all_items)
+    ocr_text_df = pd.DataFrame(ocr_text_records)
 
     if raw_df.empty:
         summary_df = pd.DataFrame(columns=["ItemNo", "Description", "Quantity", "PalletList", "DocumentList"])
@@ -336,7 +365,7 @@ def process_delivery_files(delivery_files):
 
         summary_df = summary_df[["ItemNo", "Description", "Quantity", "PalletList", "DocumentList"]]
 
-    return raw_df, summary_df, preview_images
+    return raw_df, summary_df, preview_images, ocr_text_df
 
 
 def build_tracker_lookup(wb):
@@ -554,7 +583,7 @@ if process_clicked:
     st.session_state.results = {}
 
     with st.spinner("Running OCR and updating tracker..."):
-        raw_df, summary_df, preview_images = process_delivery_files(delivery_files)
+        raw_df, summary_df, preview_images, ocr_text_df = process_delivery_files(delivery_files)
 
         tracker_bytes = tracker_file.getvalue()
         wb = load_workbook(BytesIO(tracker_bytes))
@@ -567,6 +596,12 @@ if process_clicked:
             {
                 "Raw_OCR_Data": raw_df if not raw_df.empty else pd.DataFrame(),
                 "Summarized_Totals": summary_df if not summary_df.empty else pd.DataFrame(),
+            }
+        )
+
+        ocr_text_export_bytes = dataframe_to_excel_bytes(
+            {
+                "OCR_Raw_Text": ocr_text_df if not ocr_text_df.empty else pd.DataFrame()
             }
         )
 
@@ -583,6 +618,8 @@ if process_clicked:
         "preview_images": preview_images,
         "updated_tracker_bytes": updated_tracker_bytes,
         "ocr_results_bytes": ocr_results_bytes,
+        "ocr_text_export_bytes": ocr_text_export_bytes,
+        "ocr_text_df": ocr_text_df,
         "unmatched_export_bytes": unmatched_export_bytes,
     }
 
@@ -601,6 +638,8 @@ if st.session_state.processed:
     preview_images = results["preview_images"]
     updated_tracker_bytes = results["updated_tracker_bytes"]
     ocr_results_bytes = results["ocr_results_bytes"]
+    ocr_text_export_bytes = results["ocr_text_export_bytes"]
+    ocr_text_df = results["ocr_text_df"]
     unmatched_export_bytes = results["unmatched_export_bytes"]
 
     st.success("Processing complete.")
@@ -631,6 +670,9 @@ if st.session_state.processed:
         with st.expander("Summary items not found in tracker", expanded=False):
             st.dataframe(not_found_df, use_container_width=True)
 
+    with st.expander("OCR Raw Text Preview", expanded=False):
+        st.dataframe(ocr_text_df, use_container_width=True)
+
     st.download_button(
         label="Download Updated Tracker",
         data=updated_tracker_bytes,
@@ -642,6 +684,13 @@ if st.session_state.processed:
         label="Download OCR Results",
         data=ocr_results_bytes,
         file_name="OCR_Results.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    st.download_button(
+        label="Download OCR Raw Text",
+        data=ocr_text_export_bytes,
+        file_name="OCR_Raw_Text.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
